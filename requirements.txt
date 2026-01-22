@@ -9,6 +9,5 @@ numpy==1.24.3
 python-dotenv==1.0.0
 pydantic==2.5.0
 pymupdf==1.23.8
-pypdf2==3.0.1
 python-dateutil==2.8.2
 regex==2023.10.3

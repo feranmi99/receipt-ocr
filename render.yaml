@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: receipt-ocr-api
+    env: python
+    region: oregon  # or singapore, frankfurt, etc.
+    plan: free  # or starter, standard
+    buildCommand: |
+      apt-get update
+      apt-get install -y \
+        tesseract-ocr \
+        tesseract-ocr-eng \
+        poppler-utils \
+        libgl1-mesa-glx
+      pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
+    autoDeploy: true
