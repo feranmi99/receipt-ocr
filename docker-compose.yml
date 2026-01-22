@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  receipt-ocr:
+    build: .
+    container_name: receipt-ocr-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./results:/app/results
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
+    restart: unless-stopped
