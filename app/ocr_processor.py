@@ -1,58 +1,57 @@
 import os
-import tempfile
 import re
+import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 import pytesseract
 from PIL import Image
 import cv2
 import numpy as np
-import fitz  # PyMuPDF for PDFs
+import fitz
 from pdf2image import convert_from_path
-import dateutil.parser
-import logging
+from dateutil.parser import parse
+import tempfile
 
-from app.config import Config
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class ReceiptOCRProcessor:
     def __init__(self, tesseract_path: str = None):
-        """
-        Initialize OCR processor.
-        
-        Args:
-            tesseract_path: Path to tesseract executable (if not in PATH)
-        """
         if tesseract_path and os.path.exists(tesseract_path):
-            # pytesseract.pytesseract.tesseract_cmd = tesseract_path
-            try:
-                pytesseract.pytesseract.tesseract_cmd = Config.get_tesseract_path()
-            except:
-                # Fallback to PATH
-                pytesseract.pytesseract.tesseract_cmd = 'tesseract'
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
         
-        # Common receipt patterns
+        # Nigerian-specific receipt patterns
         self.amount_patterns = [
-            r'(?:total|amount|amt|sum|balance)[\s:]*[\$£€¥₹₦]?\s*(\d+[,\d]*\.?\d*)',
-            r'[\$£€¥₹₦]\s*(\d+[,\d]*\.?\d*)',
-            r'(\d+[,\d]*\.?\d\d)\s*(?:usd|ngn|gbp|eur|inr)',
+            # Nigerian currency patterns
+            r'(?:₦|NGN|Naira)[\s:]*[\s]*([\d,]+\.?\d*)',
+            r'(?:amount|amt|total|sum|balance|transfer|sent|received)[\s:]*[\s₦NGN]*([\d,]+\.?\d*)',
+            r'([\d,]+\.?\d{2})\s*(?:₦|NGN|naira)',
+            # Transaction amount patterns (common in Nigerian receipts)
+            r'(?:transaction|txn|trans)[\s:]*[\s]*([\d,]+\.?\d*)',
+            r'#?([\d,]+\.?\d{2})\b',
         ]
         
+        # Nigerian date patterns (DD/MM/YYYY, DD-MM-YYYY, etc.)
         self.date_patterns = [
             r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\b',
-            r'\b(\d{2,4}[/\-]\d{1,2}[/\-]\d{1,2})\b',
-            r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]* \d{1,2},? \d{4}\b',
-            r'\b\d{1,2} (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]* \d{4}\b',
+            r'\b(\d{4}[/\-]\d{1,2}[/\-]\d{1,2})\b',
+            r'\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4})\b',
+            r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b',
+            # Nigerian format with time
+            r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\b',
         ]
         
-        self.currency_symbols = ['$', '£', '€', '¥', '₹', '₦', 'USD', 'NGN', 'GBP', 'EUR', 'INR']
-    
-    def preprocess_image(self, image: np.ndarray) -> np.ndarray:
+        # Transaction ID patterns
+        self.transaction_patterns = [
+            r'transaction\s*(?:no|number|id|#)[\s:]*[\s]*([a-zA-Z0-9\-]+)',
+            r'txn\s*(?:no|number|id|#)[\s:]*[\s]*([a-zA-Z0-9\-]+)',
+            r'trans\s*(?:no|number|id|#)[\s:]*[\s]*([a-zA-Z0-9\-]+)',
+            r'ref\s*(?:no|number|id|#)[\s:]*[\s]*([a-zA-Z0-9\-]+)',
+            r'([A-Z0-9]{10,20})\b',  # Long alphanumeric strings
+        ]
+
+    def preprocess_image_for_nigerian_receipts(self, image: np.ndarray) -> np.ndarray:
         """
-        Preprocess image for better OCR results.
+        Special preprocessing for Nigerian receipts (often have colors, watermarks)
         """
         try:
             # Convert to grayscale
@@ -61,27 +60,32 @@ class ReceiptOCRProcessor:
             else:
                 gray = image
             
+            # Apply bilateral filter to preserve edges while removing noise
+            filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+            
             # Apply adaptive thresholding
             processed = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY, 11, 2
             )
             
-            # Remove noise
+            # Apply morphological operations to clean up text
             kernel = np.ones((1, 1), np.uint8)
             processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel)
             
-            # Enhance contrast
-            processed = cv2.convertScaleAbs(processed, alpha=1.5, beta=0)
+            # Apply dilation to make text thicker
+            kernel = np.ones((2, 2), np.uint8)
+            processed = cv2.dilate(processed, kernel, iterations=1)
             
             return processed
+            
         except Exception as e:
             logger.error(f"Error preprocessing image: {e}")
             return image
-    
-    def extract_text_from_image(self, image_path: str) -> str:
+
+    def extract_text_with_optimizations(self, image_path: str) -> str:
         """
-        Extract text from image using Tesseract OCR.
+        Extract text with optimizations for Nigerian receipts
         """
         try:
             # Read image
@@ -89,141 +93,185 @@ class ReceiptOCRProcessor:
             if img is None:
                 raise ValueError(f"Cannot read image: {image_path}")
             
-            # Preprocess image
-            processed_img = self.preprocess_image(img)
+            # Preprocess for Nigerian receipts
+            processed_img = self.preprocess_image_for_nigerian_receipts(img)
             
-            # Convert to PIL Image for pytesseract
+            # Convert to PIL Image
             pil_img = Image.fromarray(processed_img)
             
-            # Extract text with multiple configurations
-            config = '--oem 3 --psm 6'
-            text = pytesseract.image_to_string(pil_img, config=config)
+            # Try multiple OCR configurations
+            configs = [
+                '--oem 3 --psm 6',  # Assume uniform block of text
+                '--oem 3 --psm 11',  # Sparse text
+                '--oem 3 --psm 4',   # Single column of text
+                '--oem 3 --psm 3',   # Fully automatic page segmentation
+            ]
             
-            # Try with different PSM if no text found
-            if not text.strip():
-                config = '--oem 3 --psm 11'
+            all_text = ""
+            for config in configs:
                 text = pytesseract.image_to_string(pil_img, config=config)
+                all_text += text + "\n---\n"
             
-            logger.info(f"Extracted text from {image_path}")
-            return text.strip()
+            # Clean up the text
+            cleaned_text = self.clean_extracted_text(all_text)
+            
+            logger.info(f"Extracted {len(cleaned_text)} characters from {image_path}")
+            return cleaned_text
+            
         except Exception as e:
             logger.error(f"Error extracting text from image {image_path}: {e}")
             return ""
-    
-    def extract_text_from_pdf(self, pdf_path: str) -> str:
+
+    def clean_extracted_text(self, text: str) -> str:
+        """Clean and normalize extracted text"""
+        # Replace multiple spaces with single space
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Fix common OCR errors in Nigerian receipts
+        replacements = {
+            '0Pay': 'OPay',
+            '0pay': 'OPay',
+            'QPay': 'OPay',
+            'Naira': 'NGN',
+            'Naira ': 'NGN ',
+            'naira': 'NGN',
+            'transction': 'transaction',
+            'transacation': 'transaction',
+            'sucessful': 'successful',
+            'reciept': 'receipt',
+            'recieved': 'received',
+        }
+        
+        for wrong, correct in replacements.items():
+            text = text.replace(wrong, correct)
+        
+        return text.strip()
+
+    def extract_amounts_smart(self, text: str) -> List[float]:
         """
-        Extract text from PDF file.
-        """
-        try:
-            text = ""
-            
-            # Method 1: Try PyMuPDF first (faster for text-based PDFs)
-            try:
-                doc = fitz.open(pdf_path)
-                for page in doc:
-                    text += page.get_text()
-                doc.close()
-                
-                if text.strip():
-                    logger.info(f"Extracted text from PDF using PyMuPDF: {pdf_path}")
-                    return text.strip()
-            except:
-                pass
-            
-            # Method 2: Convert PDF to images and use OCR
-            images = convert_from_path(pdf_path)
-            for i, image in enumerate(images):
-                # Save temp image
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
-                    temp_path = temp_file.name
-                    image.save(temp_path, 'PNG')
-                
-                # Extract text from image
-                page_text = self.extract_text_from_image(temp_path)
-                text += f"\n--- Page {i+1} ---\n{page_text}\n"
-                
-                # Clean up
-                os.unlink(temp_path)
-            
-            logger.info(f"Extracted text from PDF using OCR: {pdf_path}")
-            return text.strip()
-        except Exception as e:
-            logger.error(f"Error extracting text from PDF {pdf_path}: {e}")
-            return ""
-    
-    def extract_amounts(self, text: str) -> List[float]:
-        """
-        Extract monetary amounts from text.
+        Smart amount extraction for Nigerian receipts
         """
         amounts = []
         text_lower = text.lower()
         
-        for pattern in self.amount_patterns:
-            matches = re.findall(pattern, text_lower, re.IGNORECASE)
+        # First, look for amount with NGN/₦ symbol
+        ngn_patterns = [
+            r'₦\s*([\d,]+\.?\d*)',
+            r'ngn\s*([\d,]+\.?\d*)',
+            r'([\d,]+\.?\d{2})\s*(?:₦|ngn)',
+        ]
+        
+        for pattern in ngn_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
                 try:
-                    # Clean the amount string
                     clean_amount = match.replace(',', '')
                     amount = float(clean_amount)
                     amounts.append(amount)
                 except ValueError:
                     continue
         
-        # Also look for standalone numbers that could be amounts
-        standalone_numbers = re.findall(r'\b(\d+[,\d]*\.?\d\d)\b', text)
-        for num in standalone_numbers:
+        # Look for common amount patterns in receipts
+        amount_keywords = [
+            'amount', 'total', 'sent', 'received', 'transfer',
+            'balance', 'sum', 'value', 'payment'
+        ]
+        
+        for keyword in amount_keywords:
+            pattern = rf'{keyword}[\s:]*[\s₦ngn]*([\d,]+\.?\d*)'
+            matches = re.findall(pattern, text_lower, re.IGNORECASE)
+            for match in matches:
+                try:
+                    clean_amount = match.replace(',', '')
+                    amount = float(clean_amount)
+                    # Filter out unlikely amounts (phone numbers, dates, etc.)
+                    if 100 <= amount <= 10000000:  # ₦100 to ₦10M
+                        amounts.append(amount)
+                except ValueError:
+                    continue
+        
+        # Extract standalone numbers that look like amounts
+        number_pattern = r'\b(\d{3,}[,\d]*\.?\d{2})\b'
+        matches = re.findall(number_pattern, text)
+        for match in matches:
             try:
-                clean_num = num.replace(',', '')
+                clean_num = match.replace(',', '')
                 amount = float(clean_num)
-                # Only consider reasonable amounts (not too small or too large for receipts)
-                if 1 <= amount <= 1000000:  # Adjust range as needed
+                # Filter: must be reasonable for a transaction
+                if 100 <= amount <= 10000000 and amount not in amounts:
                     amounts.append(amount)
             except ValueError:
                 continue
         
         # Remove duplicates and sort
         unique_amounts = sorted(list(set(amounts)))
+        
+        # If we found multiple amounts, prioritize larger ones (transfers are usually significant)
+        if len(unique_amounts) > 1:
+            # Filter out amounts that look like phone numbers or IDs
+            filtered_amounts = []
+            for amount in unique_amounts:
+                amount_str = str(int(amount)) if amount.is_integer() else str(amount)
+                # Skip if it looks like a phone number (11 digits starting with 0)
+                if len(amount_str) == 11 and amount_str.startswith('0'):
+                    continue
+                # Skip if it looks like a date (2026, 2024, etc.)
+                if 2020 <= amount <= 2030:
+                    continue
+                filtered_amounts.append(amount)
+            return filtered_amounts
+        
         return unique_amounts
-    
-    def extract_dates(self, text: str) -> List[datetime]:
+
+    def extract_dates_smart(self, text: str) -> List[datetime]:
         """
-        Extract dates from text.
+        Smart date extraction for Nigerian receipts
         """
         dates = []
         
-        for pattern in self.date_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
+        # Look for date patterns with time (common in receipts)
+        datetime_patterns = [
+            r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?)\b',
+            r'\b(\d{4}[/\-]\d{1,2}[/\-]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)\b',
+        ]
+        
+        for pattern in datetime_patterns:
+            matches = re.findall(pattern, text)
             for match in matches:
                 try:
-                    # Try to parse with dateutil (handles multiple formats)
-                    date_obj = dateutil.parser.parse(match, fuzzy=True)
+                    date_obj = parse(match, fuzzy=True)
                     dates.append(date_obj)
                 except:
                     continue
         
-        # Try to find common date formats
-        common_patterns = [
-            r'\b(\d{4}-\d{2}-\d{2})\b',  # YYYY-MM-DD
-            r'\b(\d{2}/\d{2}/\d{4})\b',  # MM/DD/YYYY
-            r'\b(\d{2}-\d{2}-\d{4})\b',  # DD-MM-YYYY
+        # Look for date without time
+        date_patterns = [
+            r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})\b',
+            r'\b(\d{4}[/\-]\d{1,2}[/\-]\d{1,2})\b',
+            r'\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4})\b',
+            r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b',
         ]
         
-        for pattern in common_patterns:
-            matches = re.findall(pattern, text)
+        for pattern in date_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
                 try:
-                    date_obj = datetime.strptime(match, '%Y-%m-%d')
+                    date_obj = parse(match, fuzzy=True)
                     dates.append(date_obj)
                 except:
-                    try:
-                        date_obj = datetime.strptime(match, '%m/%d/%Y')
-                        dates.append(date_obj)
-                    except:
-                        try:
-                            date_obj = datetime.strptime(match, '%d-%m-%Y')
-                            dates.append(date_obj)
-                        except:
-                            continue
+                    continue
+        
+        # Look for "Jan 20th 2026" type patterns
+        ordinal_pattern = r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?\s*,?\s*\d{4}\b'
+        matches = re.findall(ordinal_pattern, text, re.IGNORECASE)
+        for match in matches:
+            try:
+                # Remove ordinal suffixes
+                cleaned = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', match)
+                date_obj = parse(cleaned, fuzzy=True)
+                dates.append(date_obj)
+            except:
+                continue
         
         # Remove duplicates
         unique_dates = []
@@ -235,95 +283,58 @@ class ReceiptOCRProcessor:
                 unique_dates.append(date)
         
         return sorted(unique_dates)
-    
-    def validate_against_expected(
-        self, 
-        extracted_amounts: List[float], 
-        extracted_dates: List[datetime], 
-        expected_amount: float, 
-        expected_date: str
-    ) -> Dict[str, Any]:
+
+    def extract_transaction_info(self, text: str) -> Dict[str, Any]:
         """
-        Validate extracted data against expected values.
+        Extract transaction-specific information
         """
-        try:
-            expected_date_obj = datetime.strptime(expected_date, '%Y-%m-%d')
-            
-            # Find closest amount match
-            amount_matches = False
-            matched_amount = None
-            amount_difference = float('inf')
-            
-            for amount in extracted_amounts:
-                diff = abs(amount - expected_amount)
-                # Allow 1% tolerance or ₦10, whichever is smaller
-                tolerance = min(expected_amount * 0.01, 10)
-                if diff <= tolerance:
-                    if diff < amount_difference:
-                        amount_difference = diff
-                        matched_amount = amount
-                        amount_matches = True
-            
-            # Find closest date match
-            date_matches = False
-            matched_date = None
-            date_difference = float('inf')
-            
-            for date in extracted_dates:
-                diff = abs((date - expected_date_obj).days)
-                # Allow ±1 day tolerance
-                if diff <= 1:
-                    if diff < date_difference:
-                        date_difference = diff
-                        matched_date = date
-                        date_matches = True
-            
-            return {
-                "is_valid": amount_matches and date_matches,
-                "amount_matches": amount_matches,
-                "date_matches": date_matches,
-                "extracted_amounts": extracted_amounts,
-                "extracted_dates": [d.strftime('%Y-%m-%d') for d in extracted_dates],
-                "matched_amount": matched_amount,
-                "matched_date": matched_date.strftime('%Y-%m-%d') if matched_date else None,
-                "amount_difference": amount_difference if not amount_matches else 0,
-                "date_difference": date_difference if not date_matches else 0,
-                "confidence": self.calculate_confidence(extracted_amounts, extracted_dates)
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in validation: {e}")
-            return {
-                "is_valid": False,
-                "amount_matches": False,
-                "date_matches": False,
-                "error": str(e)
-            }
-    
-    def calculate_confidence(self, amounts: List[float], dates: List[datetime]) -> float:
-        """
-        Calculate confidence score based on extracted data.
-        """
-        confidence = 0.0
+        result = {
+            "transaction_id": None,
+            "sender": None,
+            "recipient": None,
+            "bank_or_service": None,
+        }
         
-        # Higher confidence if we found amounts
-        if amounts:
-            confidence += 0.4
+        # Extract transaction ID
+        for pattern in self.transaction_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                result["transaction_id"] = matches[0]
+                break
         
-        # Higher confidence if we found dates
-        if dates:
-            confidence += 0.4
+        # Extract sender/recipient info
+        sender_patterns = [
+            r'sender[\s:]*[\s]*(.+)',
+            r'from[\s:]*[\s]*(.+)',
+        ]
         
-        # Higher confidence if we found multiple amounts (more data)
-        if len(amounts) > 1:
-            confidence += 0.1
+        recipient_patterns = [
+            r'recipient[\s:]*[\s]*(.+)',
+            r'to[\s:]*[\s]*(.+)',
+            r'beneficiary[\s:]*[\s]*(.+)',
+        ]
         
-        # Higher confidence if we found multiple dates
-        if len(dates) > 1:
-            confidence += 0.1
+        for pattern in sender_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                result["sender"] = match.group(1).strip()[:100]
+                break
         
-        return min(confidence, 1.0)
-    
+        for pattern in recipient_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                result["recipient"] = match.group(1).strip()[:100]
+                break
+        
+        # Detect bank/service
+        services = ['opay', 'palmpay', 'paystack', 'flutterwave', 'moniepoint', 'gtbank', 'zenith', 'uba', 'firstbank']
+        for service in services:
+            if service in text.lower():
+                result["bank_or_service"] = service.upper()
+                break
+        
+        return result
+
     def process_file(
         self, 
         file_path: str, 
@@ -331,44 +342,94 @@ class ReceiptOCRProcessor:
         expected_date: str = None
     ) -> Dict[str, Any]:
         """
-        Process a single file and extract information.
+        Process a receipt file with improved Nigerian receipt parsing
         """
         try:
-            # Check if file exists
+            start_time = datetime.now()
+            
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"File not found: {file_path}")
             
-            # Determine file type
             file_ext = os.path.splitext(file_path)[1].lower()
             
-            # Extract text based on file type
+            # Extract text
             if file_ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
-                extracted_text = self.extract_text_from_image(file_path)
+                extracted_text = self.extract_text_with_optimizations(file_path)
             elif file_ext == '.pdf':
                 extracted_text = self.extract_text_from_pdf(file_path)
             else:
                 raise ValueError(f"Unsupported file type: {file_ext}")
             
-            # Extract amounts and dates
-            extracted_amounts = self.extract_amounts(extracted_text)
-            extracted_dates = self.extract_dates(extracted_text)
+            # Extract information
+            extracted_amounts = self.extract_amounts_smart(extracted_text)
+            extracted_dates = self.extract_dates_smart(extracted_text)
+            transaction_info = self.extract_transaction_info(extracted_text)
+            
+            processing_time = (datetime.now() - start_time).total_seconds()
             
             result = {
                 "file_path": file_path,
-                "file_type": file_ext[1:],  # Remove dot
+                "file_type": file_ext[1:],
                 "text_extracted": bool(extracted_text.strip()),
                 "extracted_text_sample": extracted_text[:500] + "..." if len(extracted_text) > 500 else extracted_text,
                 "extracted_amounts": extracted_amounts,
-                "extracted_dates": [d.strftime('%Y-%m-%d') for d in extracted_dates],
-                "processing_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                "extracted_dates": [d.strftime('%Y-%m-%d %H:%M:%S') for d in extracted_dates],
+                "transaction_info": transaction_info,
+                "processing_time_seconds": round(processing_time, 2),
+                "processing_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "ocr_confidence": self.calculate_confidence(extracted_text, extracted_amounts, extracted_dates)
             }
             
-            # Validate against expected values if provided
+            # Validate if expected values provided
             if expected_amount is not None and expected_date is not None:
-                validation_result = self.validate_against_expected(
-                    extracted_amounts, extracted_dates, expected_amount, expected_date
-                )
-                result.update(validation_result)
+                try:
+                    expected_date_obj = datetime.strptime(expected_date, '%Y-%m-%d')
+                    
+                    # Find best amount match
+                    best_amount_match = None
+                    amount_difference = float('inf')
+                    
+                    for amount in extracted_amounts:
+                        diff = abs(amount - expected_amount)
+                        # 1% tolerance or ₦10
+                        tolerance = min(expected_amount * 0.01, 10)
+                        if diff <= tolerance and diff < amount_difference:
+                            amount_difference = diff
+                            best_amount_match = amount
+                    
+                    # Find best date match
+                    best_date_match = None
+                    date_difference = float('inf')
+                    
+                    for date in extracted_dates:
+                        diff = abs((date - expected_date_obj).days)
+                        if diff <= 1 and diff < date_difference:  # ±1 day tolerance
+                            date_difference = diff
+                            best_date_match = date
+                    
+                    validation_result = {
+                        "is_valid": best_amount_match is not None and best_date_match is not None,
+                        "amount_matches": best_amount_match is not None,
+                        "date_matches": best_date_match is not None,
+                        "matched_amount": best_amount_match,
+                        "matched_date": best_date_match.strftime('%Y-%m-%d') if best_date_match else None,
+                        "expected_amount": expected_amount,
+                        "expected_date": expected_date,
+                        "amount_difference": amount_difference if best_amount_match is None else 0,
+                        "date_difference": date_difference if best_date_match is None else 0,
+                        "validation_score": self.calculate_validation_score(
+                            best_amount_match is not None,
+                            best_date_match is not None,
+                            len(extracted_amounts),
+                            len(extracted_dates)
+                        )
+                    }
+                    
+                    result.update(validation_result)
+                    
+                except Exception as e:
+                    logger.error(f"Validation error: {e}")
+                    result["validation_error"] = str(e)
             
             return result
             
@@ -377,9 +438,82 @@ class ReceiptOCRProcessor:
             return {
                 "file_path": file_path,
                 "error": str(e),
-                "success": False
+                "success": False,
+                "processing_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
 
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        """Extract text from PDF with fallback to OCR"""
+        try:
+            text = ""
+            
+            # Try PyMuPDF first (fast for text-based PDFs)
+            try:
+                doc = fitz.open(pdf_path)
+                for page in doc:
+                    text += page.get_text()
+                doc.close()
+                
+                if text.strip():
+                    return text.strip()
+            except:
+                pass
+            
+            # Fallback to OCR for scanned PDFs
+            images = convert_from_path(pdf_path)
+            for i, image in enumerate(images):
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                    temp_path = temp_file.name
+                    image.save(temp_path, 'PNG')
+                
+                page_text = self.extract_text_with_optimizations(temp_path)
+                text += f"\n--- Page {i+1} ---\n{page_text}\n"
+                
+                os.unlink(temp_path)
+            
+            return text.strip()
+            
+        except Exception as e:
+            logger.error(f"Error extracting text from PDF {pdf_path}: {e}")
+            return ""
 
-# Singleton instance
+    def calculate_confidence(self, text: str, amounts: List[float], dates: List[datetime]) -> float:
+        """Calculate OCR confidence score"""
+        confidence = 0.0
+        
+        if text.strip():
+            confidence += 0.3
+        
+        if amounts:
+            confidence += 0.4
+        
+        if dates:
+            confidence += 0.3
+        
+        # Bonus for having transaction info
+        if any(keyword in text.lower() for keyword in ['transaction', 'receipt', 'successful', 'transfer']):
+            confidence += 0.1
+        
+        return min(confidence, 1.0)
+
+    def calculate_validation_score(self, amount_match: bool, date_match: bool, 
+                                  num_amounts: int, num_dates: int) -> float:
+        """Calculate validation score"""
+        score = 0.0
+        
+        if amount_match:
+            score += 0.5
+        if date_match:
+            score += 0.5
+        
+        # Bonus for multiple matches
+        if num_amounts > 1:
+            score += 0.1
+        if num_dates > 1:
+            score += 0.1
+        
+        return min(score, 1.0)
+
+
+# Global instance
 ocr_processor = ReceiptOCRProcessor()
