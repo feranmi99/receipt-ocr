@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 import pytesseract
@@ -49,74 +50,199 @@ class ReceiptOCRProcessor:
             r'([A-Z0-9]{10,20})\b',  # Long alphanumeric strings
         ]
 
-    def preprocess_image_for_nigerian_receipts(self, image: np.ndarray) -> np.ndarray:
-        """
-        Special preprocessing for Nigerian receipts (often have colors, watermarks)
-        """
+    def _get_image_characteristics(self, image: np.ndarray) -> Dict[str, Any]:
+        """Analyze image to determine optimal processing strategy"""
         try:
-            # Convert to grayscale
             if len(image.shape) == 3:
                 gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             else:
                 gray = image
             
-            # Apply bilateral filter to preserve edges while removing noise
-            filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+            # Calculate brightness and contrast
+            mean_brightness = np.mean(gray)
+            std_brightness = np.std(gray) # Contrast
             
-            # Apply adaptive thresholding
-            processed = cv2.adaptiveThreshold(
-                filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY, 11, 2
-            )
+            # Estimate noise using Laplacian variance
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
             
-            # Apply morphological operations to clean up text
-            kernel = np.ones((1, 1), np.uint8)
-            processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel)
+            # Estimate text density (percentage of edges)
+            edges = cv2.Canny(gray, 100, 200)
+            text_density = np.sum(edges > 0) / (gray.shape[0] * gray.shape[1])
             
-            # Apply dilation to make text thicker
-            kernel = np.ones((2, 2), np.uint8)
-            processed = cv2.dilate(processed, kernel, iterations=1)
+            # Check if it's likely a digital screenshot (low noise, high sharpness, uniform areas)
+            # Screenshots usually have very high sharpness and distinct edges
+            is_digital = bool(laplacian_var > 400 and text_density < 0.05)
             
-            return processed
+            return {
+                "mean_brightness": float(mean_brightness),
+                "contrast": float(std_brightness),
+                "sharpness": float(laplacian_var),
+                "text_density": float(text_density),
+                "is_likely_digital": is_digital,
+                "is_low_light": bool(mean_brightness < 80),
+                "height": int(image.shape[0]),
+                "width": int(image.shape[1])
+            }
+        except Exception as e:
+            logger.error(f"Error analyzing image: {e}")
+            return {"is_likely_digital": False}
+
+    def _calculate_ocr_confidence(self, text: str) -> float:
+        """Determine if OCR result is reliable based on key fields presence"""
+        if not text or len(text.strip()) < 10:
+            return 0.0
+        
+        score = 0.0
+        text_lower = text.lower()
+        
+        # Check for Nigerian Financial Keywords (Weight: 0.4)
+        keywords = ['transaction', 'successful', 'amount', 'ngn', '₦', 'sender', 'recipient', 'beneficiary', 'ref', 'terminal', 'merchant', 'approved']
+        matches = sum(1 for kw in keywords if kw in text_lower)
+        score += min((matches / (len(keywords) * 0.4)) * 0.4, 0.4)
+        
+        # Check for Transaction ID/Ref patterns (Weight: 0.3)
+        if any(re.search(p, text, re.IGNORECASE) for p in self.transaction_patterns):
+            score += 0.3
+            
+        # Check for Amount patterns (Weight: 0.2)
+        # Look for ₦ or NGN followed by digits
+        if re.search(r'(?:₦|NGN|naira)\s*[\d,]+', text, re.IGNORECASE):
+            score += 0.2
+        elif re.search(r'[\d,]+\.\d{2}', text):
+            score += 0.1
+            
+        # Structural check: does it look like a receipt? (Weight: 0.1)
+        if len(text.splitlines()) > 5:
+            score += 0.1
+            
+        return min(score, 1.0)
+
+    def preprocess_image_progressive(self, image: np.ndarray, level: int = 1) -> np.ndarray:
+        """
+        Progressive preprocessing levels optimized for speed:
+        Level 1: Grayscale + Otsu threshold (Fastest, best for screenshots)
+        Level 2: Level 1 + Gaussian Blur (Good for moderately noisy images)
+        Level 3: Level 2 + Bilateral Filter (Slowest, for noisy/poor photos)
+        """
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+
+            if level == 1:
+                # Grayscale + Otsu threshold
+                _, processed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                return processed
+
+            if level == 2:
+                # Gaussian Blur + Adaptive Threshold
+                blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+                processed = cv2.adaptiveThreshold(
+                    blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY, 11, 2
+                )
+                return processed
+
+            if level == 3:
+                # Bilateral Filter + Adaptive Threshold + Morphology
+                # Only use if confidence is low after Level 1 & 2
+                filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+                processed = cv2.adaptiveThreshold(
+                    filtered, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY, 11, 2
+                )
+                
+                kernel = np.ones((1, 1), np.uint8)
+                processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, kernel)
+                return processed
+            
+            return gray
             
         except Exception as e:
-            logger.error(f"Error preprocessing image: {e}")
+            logger.error(f"Error in progressive preprocessing: {e}")
             return image
 
     def extract_text_with_optimizations(self, image_path: str) -> str:
         """
-        Extract text with optimizations for Nigerian receipts
+        Optimized text extraction with early exit, progressive preprocessing,
+        caching, and timeout protection.
         """
+        start_time = time.time()
+        timeout = 15.0 # 15 seconds max logic
+        
         try:
-            # Read image
             img = cv2.imread(image_path)
             if img is None:
                 raise ValueError(f"Cannot read image: {image_path}")
             
-            # Preprocess for Nigerian receipts
-            processed_img = self.preprocess_image_for_nigerian_receipts(img)
+            characteristics = self._get_image_characteristics(img)
+            logger.info(f"Image characteristics: {characteristics}")
             
-            # Convert to PIL Image
-            pil_img = Image.fromarray(processed_img)
+            final_text = ""
+            best_confidence = 0.0
             
-            # Try multiple OCR configurations
-            configs = [
-                '--oem 3 --psm 6',  # Assume uniform block of text
-                '--oem 3 --psm 11',  # Sparse text
-                '--oem 3 --psm 4',   # Single column of text
-                '--oem 3 --psm 3',   # Fully automatic page segmentation
-            ]
+            # Adaptive PSM selection: PSM 6 is usually best for receipts
+            # We focus on PSM 6 first, only try others if needed
+            psms = [6, 3, 11]
             
-            all_text = ""
-            for config in configs:
-                text = pytesseract.image_to_string(pil_img, config=config)
-                all_text += text + "\n---\n"
+            # Preprocessed images cache to avoid re-calculating
+            preprocessed_cache = {}
             
-            # Clean up the text
-            cleaned_text = self.clean_extracted_text(all_text)
+            # Progressive levels
+            # Level 1: Fast/Screen, Level 2: Moderate, Level 3: Slow/Noisy
+            levels = [1, 2, 3]
             
-            logger.info(f"Extracted {len(cleaned_text)} characters from {image_path}")
-            return cleaned_text
+            # Start with digital assumption if likely
+            if not characteristics.get("is_likely_digital") and characteristics.get("contrast", 0) < 40:
+                levels = [2, 1, 3] # Start with moderate if low contrast
+
+            for level in levels:
+                # Check timeout
+                if time.time() - start_time > timeout:
+                    logger.warning(f"Timeout reached. Returning best result with confidence {best_confidence}")
+                    break
+                    
+                # Get or create preprocessed image
+                if level not in preprocessed_cache:
+                    preprocessed_cache[level] = self.preprocess_image_progressive(img, level=level)
+                
+                processed_img = preprocessed_cache[level]
+                pil_img = Image.fromarray(processed_img)
+                
+                # 1. First try PSM 6 (fastest and most reliable for receipts)
+                config_6 = f'--oem 3 --psm 6'
+                text_6 = pytesseract.image_to_string(pil_img, config=config_6)
+                conf_6 = self._calculate_ocr_confidence(text_6)
+                
+                if conf_6 > best_confidence:
+                    best_confidence = conf_6
+                    final_text = text_6
+                
+                # Early exit if we have found high-confidence results
+                if best_confidence >= 0.8:
+                    logger.info(f"Early exit at Level {level}, PSM 6. Confidence: {best_confidence:.2f}")
+                    return self.clean_extracted_text(final_text)
+                
+                # 2. Try other PSMs only if confidence is still low and it's Level 1 or 2
+                if best_confidence < 0.5:
+                    for psm in [3, 11]:
+                        if time.time() - start_time > timeout:
+                            break
+                            
+                        config = f'--oem 3 --psm {psm}'
+                        text = pytesseract.image_to_string(pil_img, config=config)
+                        conf = self._calculate_ocr_confidence(text)
+                        
+                        if conf > best_confidence:
+                            best_confidence = conf
+                            final_text = text
+                        
+                        if best_confidence >= 0.8:
+                            logger.info(f"Early exit at Level {level}, PSM {psm}. Confidence: {best_confidence:.2f}")
+                            return self.clean_extracted_text(final_text)
+
+            return self.clean_extracted_text(final_text)
             
         except Exception as e:
             logger.error(f"Error extracting text from image {image_path}: {e}")
@@ -124,22 +250,16 @@ class ReceiptOCRProcessor:
 
     def clean_extracted_text(self, text: str) -> str:
         """Clean and normalize extracted text"""
-        # Replace multiple spaces with single space
+        # Replace multiple spaces/newlines with single space
         text = re.sub(r'\s+', ' ', text)
         
-        # Fix common OCR errors in Nigerian receipts
+        # Specific cleanup for Nigerian receipt artifacts
         replacements = {
-            '0Pay': 'OPay',
-            '0pay': 'OPay',
-            'QPay': 'OPay',
-            'Naira': 'NGN',
-            'Naira ': 'NGN ',
-            'naira': 'NGN',
-            'transction': 'transaction',
-            'transacation': 'transaction',
-            'sucessful': 'successful',
-            'reciept': 'receipt',
-            'recieved': 'received',
+            '0Pay': 'OPay', '0pay': 'OPay', 'QPay': 'OPay',
+            'Naira': 'NGN', 'naira': 'NGN', '₦': 'NGN', # Normalize currency
+            'transction': 'transaction', 'transacation': 'transaction',
+            'sucessful': 'successful', 'reciept': 'receipt',
+            'recieved': 'received', 'beneficary': 'beneficiary'
         }
         
         for wrong, correct in replacements.items():
@@ -293,7 +413,10 @@ class ReceiptOCRProcessor:
             "sender": None,
             "recipient": None,
             "bank_or_service": None,
+            "status": "UNKNOWN",
         }
+        
+        text_lower = text.lower()
         
         # Extract transaction ID
         for pattern in self.transaction_patterns:
@@ -326,10 +449,18 @@ class ReceiptOCRProcessor:
                 result["recipient"] = match.group(1).strip()[:100]
                 break
         
+        # Detect status
+        if any(kw in text_lower for kw in ['successful', 'success', 'completed', 'paid']):
+            result["status"] = "SUCCESSFUL"
+        elif any(kw in text_lower for kw in ['failed', 'declined', 'rejected']):
+            result["status"] = "FAILED"
+        elif any(kw in text_lower for kw in ['pending', 'processing']):
+            result["status"] = "PENDING"
+        
         # Detect bank/service
-        services = ['opay', 'palmpay', 'paystack', 'flutterwave', 'moniepoint', 'gtbank', 'zenith', 'uba', 'firstbank']
+        services = ['opay', 'palmpay', 'paystack', 'flutterwave', 'moniepoint', 'gtbank', 'zenith', 'uba', 'firstbank', 'kuda', 'vfd', 'stanbic']
         for service in services:
-            if service in text.lower():
+            if service in text_lower:
                 result["bank_or_service"] = service.upper()
                 break
         
@@ -367,66 +498,84 @@ class ReceiptOCRProcessor:
             
             processing_time = (datetime.now() - start_time).total_seconds()
             
+            # Analyze image characteristics if it's an image
+            metadata = {}
+            if file_ext in ['.jpg', '.jpeg', '.png']:
+                img = cv2.imread(file_path)
+                if img is not None:
+                    metadata = self._get_image_characteristics(img)
+
             result = {
-                "file_path": file_path,
-                "file_type": file_ext[1:],
-                "text_extracted": bool(extracted_text.strip()),
-                "extracted_text_sample": extracted_text[:500] + "..." if len(extracted_text) > 500 else extracted_text,
-                "extracted_amounts": extracted_amounts,
-                "extracted_dates": [d.strftime('%Y-%m-%d %H:%M:%S') for d in extracted_dates],
-                "transaction_info": transaction_info,
-                "processing_time_seconds": round(processing_time, 2),
-                "processing_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "ocr_confidence": self.calculate_confidence(extracted_text, extracted_amounts, extracted_dates)
+                "file_metadata": {
+                    "path": file_path,
+                    "type": file_ext[1:],
+                    "characteristics": metadata
+                },
+                "extraction_summary": {
+                    "text_found": bool(extracted_text.strip()),
+                    "amounts_count": len(extracted_amounts),
+                    "dates_count": len(extracted_dates),
+                    "confidence_score": self.calculate_confidence(extracted_text, extracted_amounts, extracted_dates)
+                },
+                "data": {
+                    "amounts": extracted_amounts,
+                    "dates": [d.strftime('%Y-%m-%d %H:%M:%S') for d in extracted_dates],
+                    "transaction_info": transaction_info,
+                    "raw_text_preview": extracted_text[:1000] + "..." if len(extracted_text) > 1000 else extracted_text
+                },
+                "performance": {
+                    "processing_time_seconds": round(processing_time, 2),
+                    "timestamp": datetime.now().isoformat()
+                }
             }
             
-            # Validate if expected values provided
+            # Additional validation logic
             if expected_amount is not None and expected_date is not None:
                 try:
                     expected_date_obj = datetime.strptime(expected_date, '%Y-%m-%d')
                     
-                    # Find best amount match
+                    # Match Amount
                     best_amount_match = None
-                    amount_difference = float('inf')
-                    
+                    min_diff = float('inf')
                     for amount in extracted_amounts:
                         diff = abs(amount - expected_amount)
-                        # 1% tolerance or ₦10
-                        tolerance = min(expected_amount * 0.01, 10)
-                        if diff <= tolerance and diff < amount_difference:
-                            amount_difference = diff
+                        if diff < min_diff:
+                            min_diff = diff
                             best_amount_match = amount
                     
-                    # Find best date match
+                    # Match Date
                     best_date_match = None
-                    date_difference = float('inf')
-                    
+                    min_date_diff = float('inf')
                     for date in extracted_dates:
-                        diff = abs((date - expected_date_obj).days)
-                        if diff <= 1 and diff < date_difference:  # ±1 day tolerance
-                            date_difference = diff
+                        days_diff = abs((date.date() - expected_date_obj.date()).days)
+                        if days_diff < min_date_diff:
+                            min_date_diff = days_diff
                             best_date_match = date
-                    
-                    validation_result = {
-                        "is_valid": best_amount_match is not None and best_date_match is not None,
-                        "amount_matches": best_amount_match is not None,
-                        "date_matches": best_date_match is not None,
-                        "matched_amount": best_amount_match,
-                        "matched_date": best_date_match.strftime('%Y-%m-%d') if best_date_match else None,
-                        "expected_amount": expected_amount,
-                        "expected_date": expected_date,
-                        "amount_difference": amount_difference if best_amount_match is None else 0,
-                        "date_difference": date_difference if best_date_match is None else 0,
-                        "validation_score": self.calculate_validation_score(
-                            best_amount_match is not None,
-                            best_date_match is not None,
+
+                    # Detailed Validation Response
+                    result["validation"] = {
+                        "is_valid": min_diff <= (expected_amount * 0.02) and min_date_diff <= 1,
+                        "checks": {
+                            "amount_match": {
+                                "status": min_diff <= (expected_amount * 0.02),
+                                "expected": expected_amount,
+                                "found": best_amount_match,
+                                "difference": round(min_diff, 2)
+                            },
+                            "date_match": {
+                                "status": min_date_diff <= 1,
+                                "expected": expected_date,
+                                "found": best_date_match.strftime('%Y-%m-%d') if best_date_match else None,
+                                "days_difference": min_date_diff
+                            }
+                        },
+                        "score": self.calculate_validation_score(
+                            min_diff <= (expected_amount * 0.02),
+                            min_date_diff <= 1,
                             len(extracted_amounts),
                             len(extracted_dates)
                         )
                     }
-                    
-                    result.update(validation_result)
-                    
                 except Exception as e:
                     logger.error(f"Validation error: {e}")
                     result["validation_error"] = str(e)
