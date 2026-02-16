@@ -22,33 +22,78 @@ class ReceiptOCRProcessor:
         
         # Nigerian-specific receipt patterns
         self.amount_patterns = [
-            # Nigerian currency patterns
-            r'(?:₦|NGN|Naira)[\s:]*[\s]*([\d,]+\.?\d*)',
+            r'(?:₦|NGN|Naira|N)[\s:]*[\s]*([\d,]+\.?\d*)',
             r'(?:amount|amt|total|sum|balance|transfer|sent|received)[\s:]*[\s₦NGN]*([\d,]+\.?\d*)',
             r'([\d,]+\.?\d{2})\s*(?:₦|NGN|naira)',
-            # Transaction amount patterns (common in Nigerian receipts)
             r'(?:transaction|txn|trans)[\s:]*[\s]*([\d,]+\.?\d*)',
             r'#?([\d,]+\.?\d{2})\b',
         ]
         
-        # Nigerian date patterns (DD/MM/YYYY, DD-MM-YYYY, etc.)
         self.date_patterns = [
             r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\b',
             r'\b(\d{4}[/\-]\d{1,2}[/\-]\d{1,2})\b',
             r'\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4})\b',
             r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b',
-            # Nigerian format with time
             r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?\b',
         ]
         
-        # Transaction ID patterns
         self.transaction_patterns = [
             r'transaction\s*(?:no|number|id|#)[\s:]*[\s]*([a-zA-Z0-9\-]+)',
             r'txn\s*(?:no|number|id|#)[\s:]*[\s]*([a-zA-Z0-9\-]+)',
-            r'trans\s*(?:no|number|id|#)[\s:]*[\s]*([a-zA-Z0-9\-]+)',
             r'ref\s*(?:no|number|id|#)[\s:]*[\s]*([a-zA-Z0-9\-]+)',
-            r'([A-Z0-9]{10,20})\b',  # Long alphanumeric strings
+            r'\b([A-Z0-9]{10,24})\b',  # Long alphanumeric strings
         ]
+
+        self.nigerian_banks = [
+            'OPAY', 'PALMPAY', 'PAYSTACK', 'FLUTTERWAVE', 'MONIEPOINT', 
+            'GTBANK', 'GUARANTY TRUST', 'ZENITH', 'UBA', 'UNITED BANK FOR AFRICA',
+            'FIRSTBANK', 'FIRST BANK', 'KUDA', 'STANBIC', 'VFD', 'ACCESS BANK',
+            'FIDELITY', 'WEMA', 'HERITAGE', 'UNION BANK', 'STERLING', 'POLARIS',
+            'KEYSTONE', 'GLOBUS', 'TITAN', 'PROVIDUS', 'CARBON', 'FAIRMONEY',
+            'PIGGYVEST', 'PARALLEX', 'LOTUS', 'LOTUS BANK', 'TAJBANK', 'TAJ BANK',
+            'SUDIPAY', 'REGINA MFB', 'TEAMAPT', 'SPARKLE'
+        ]
+
+        self.status_keywords = {
+            'SUCCESSFUL': ['successful', 'completed', 'paid', 'success', 'approved', 'done'],
+            'FAILED': ['failed', 'declined', 'rejected', 'failed', 'unsuccessful', 'cancelled'],
+            'PENDING': ['pending', 'processing', 'in-progress', 'submitted']
+        }
+
+    def _resize_image(self, image: np.ndarray, max_width: int = 1200) -> np.ndarray:
+        """Resize image to a max width while maintaining aspect ratio"""
+        height, width = image.shape[:2]
+        if width > max_width:
+            scaling_factor = max_width / float(width)
+            new_size = (max_width, int(height * scaling_factor))
+            return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+        return image
+
+    def _crop_to_text(self, image: np.ndarray) -> np.ndarray:
+        """Crop image to the region containing text by removing white/empty margins"""
+        try:
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+            
+            # Binary threshold to find text regions
+            _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+            
+            # Find all non-zero points
+            coords = cv2.findNonZero(thresh)
+            if coords is not None:
+                x, y, w, h = cv2.boundingRect(coords)
+                # Add a small padding
+                padding = 10
+                x = max(0, x - padding)
+                y = max(0, y - padding)
+                w = min(image.shape[1] - x, w + 2 * padding)
+                h = min(image.shape[0] - y, h + 2 * padding)
+                return image[y:y+h, x:x+w]
+        except Exception as e:
+            logger.error(f"Error cropping image: {e}")
+        return image
 
     def _get_image_characteristics(self, image: np.ndarray) -> Dict[str, Any]:
         """Analyze image to determine optimal processing strategy"""
@@ -69,8 +114,7 @@ class ReceiptOCRProcessor:
             edges = cv2.Canny(gray, 100, 200)
             text_density = np.sum(edges > 0) / (gray.shape[0] * gray.shape[1])
             
-            # Check if it's likely a digital screenshot (low noise, high sharpness, uniform areas)
-            # Screenshots usually have very high sharpness and distinct edges
+            # Check if it's likely a digital screenshot
             is_digital = bool(laplacian_var > 400 and text_density < 0.05)
             
             return {
@@ -105,8 +149,7 @@ class ReceiptOCRProcessor:
             score += 0.3
             
         # Check for Amount patterns (Weight: 0.2)
-        # Look for ₦ or NGN followed by digits
-        if re.search(r'(?:₦|NGN|naira)\s*[\d,]+', text, re.IGNORECASE):
+        if re.search(r'(?:₦|NGN|naira|n)\s*[\d,]+', text, re.IGNORECASE):
             score += 0.2
         elif re.search(r'[\d,]+\.\d{2}', text):
             score += 0.1
@@ -163,185 +206,178 @@ class ReceiptOCRProcessor:
             logger.error(f"Error in progressive preprocessing: {e}")
             return image
 
+    def _ocr_with_confidence_filter(self, pil_img: Image, config: str) -> str:
+        """Run OCR and ignore words with confidence < 40"""
+        data = pytesseract.image_to_data(pil_img, config=config, output_type=pytesseract.Output.DICT)
+        words = []
+        for i in range(len(data['text'])):
+            if int(data['conf'][i]) >= 40:
+                words.append(data['text'][i])
+        return " ".join(words)
+
     def extract_text_with_optimizations(self, image_path: str) -> str:
         """
         Optimized text extraction with early exit, progressive preprocessing,
-        caching, and timeout protection.
+        and strict stage-based strategy.
         """
         start_time = time.time()
-        timeout = 15.0 # 15 seconds max logic
+        timeout = 15.0
         
         try:
             img = cv2.imread(image_path)
             if img is None:
                 raise ValueError(f"Cannot read image: {image_path}")
             
+            # --- PREPARATION ---
+            # 1. Resize before anything else
+            img = self._resize_image(img, max_width=1200)
+            
+            # 2. Crop to text region
+            img = self._crop_to_text(img)
+            
             characteristics = self._get_image_characteristics(img)
             logger.info(f"Image characteristics: {characteristics}")
             
-            final_text = ""
+            is_photo = not characteristics.get("is_likely_digital", True)
+            
+            best_text = ""
             best_confidence = 0.0
-            
-            # Adaptive PSM selection: PSM 6 is usually best for receipts
-            # We focus on PSM 6 first, only try others if needed
-            psms = [6, 3, 11]
-            
-            # Preprocessed images cache to avoid re-calculating
-            preprocessed_cache = {}
-            
-            # Progressive levels
-            # Level 1: Fast/Screen, Level 2: Moderate, Level 3: Slow/Noisy
-            levels = [1, 2, 3]
-            
-            # Start with digital assumption if likely
-            if not characteristics.get("is_likely_digital") and characteristics.get("contrast", 0) < 40:
-                levels = [2, 1, 3] # Start with moderate if low contrast
 
-            for level in levels:
-                # Check timeout
-                if time.time() - start_time > timeout:
-                    logger.warning(f"Timeout reached. Returning best result with confidence {best_confidence}")
-                    break
-                    
-                # Get or create preprocessed image
-                if level not in preprocessed_cache:
-                    preprocessed_cache[level] = self.preprocess_image_progressive(img, level=level)
-                
-                processed_img = preprocessed_cache[level]
-                pil_img = Image.fromarray(processed_img)
-                
-                # 1. First try PSM 6 (fastest and most reliable for receipts)
-                config_6 = f'--oem 3 --psm 6'
-                text_6 = pytesseract.image_to_string(pil_img, config=config_6)
-                conf_6 = self._calculate_ocr_confidence(text_6)
-                
-                if conf_6 > best_confidence:
-                    best_confidence = conf_6
-                    final_text = text_6
-                
-                # Early exit if we have found high-confidence results
-                if best_confidence >= 0.8:
-                    logger.info(f"Early exit at Level {level}, PSM 6. Confidence: {best_confidence:.2f}")
-                    return self.clean_extracted_text(final_text)
-                
-                # 2. Try other PSMs only if confidence is still low and it's Level 1 or 2
-                if best_confidence < 0.5:
-                    for psm in [3, 11]:
-                        if time.time() - start_time > timeout:
-                            break
-                            
-                        config = f'--oem 3 --psm {psm}'
-                        text = pytesseract.image_to_string(pil_img, config=config)
-                        conf = self._calculate_ocr_confidence(text)
-                        
-                        if conf > best_confidence:
-                            best_confidence = conf
-                            final_text = text
-                        
-                        if best_confidence >= 0.8:
-                            logger.info(f"Early exit at Level {level}, PSM {psm}. Confidence: {best_confidence:.2f}")
-                            return self.clean_extracted_text(final_text)
+            # --- STAGE 1: FAST PATH ---
+            logger.info("Executing STAGE 1: FAST PATH")
+            processed_1 = self.preprocess_image_progressive(img, level=1)
+            text_1 = self._ocr_with_confidence_filter(Image.fromarray(processed_1), config='--oem 3 --psm 6')
+            conf_1 = self._calculate_ocr_confidence(text_1)
+            
+            if conf_1 >= 0.6:
+                logger.info(f"Early exit at Stage 1. Confidence: {conf_1:.2f}")
+                return self.clean_extracted_text(text_1)
+            
+            best_text, best_confidence = text_1, conf_1
 
-            return self.clean_extracted_text(final_text)
+            # --- STAGE 2: MODERATE PATH ---
+            logger.info("Executing STAGE 2: MODERATE PATH")
+            processed_2 = self.preprocess_image_progressive(img, level=2)
+            # Try PSM 6 first
+            text_2 = self._ocr_with_confidence_filter(Image.fromarray(processed_2), config='--oem 3 --psm 6')
+            conf_2 = self._calculate_ocr_confidence(text_2)
+            
+            if conf_2 > best_confidence:
+                best_text, best_confidence = text_2, conf_2
+            
+            if best_confidence >= 0.6:
+                logger.info(f"Early exit at Stage 2 (PSM 6). Confidence: {best_confidence:.2f}")
+                return self.clean_extracted_text(best_text)
+
+            # Fallback to PSM 3 (once only)
+            text_2_psm3 = self._ocr_with_confidence_filter(Image.fromarray(processed_2), config='--oem 3 --psm 3')
+            conf_2_psm3 = self._calculate_ocr_confidence(text_2_psm3)
+            
+            if conf_2_psm3 > best_confidence:
+                best_text, best_confidence = text_2_psm3, conf_2_psm3
+
+            if best_confidence >= 0.6:
+                logger.info(f"Early exit at Stage 2 (PSM 3). Confidence: {best_confidence:.2f}")
+                return self.clean_extracted_text(best_text)
+
+            # --- STAGE 3: SLOW PATH (LAST RESORT) ---
+            # Only if photo receipt or very low confidence
+            if is_photo or best_confidence < 0.4:
+                logger.info("Executing STAGE 3: SLOW PATH")
+                processed_3 = self.preprocess_image_progressive(img, level=3)
+                text_3 = self._ocr_with_confidence_filter(Image.fromarray(processed_3), config='--oem 3 --psm 6')
+                conf_3 = self._calculate_ocr_confidence(text_3)
+                
+                if conf_3 > best_confidence:
+                    best_text, best_confidence = text_3, conf_3
+            
+            return self.clean_extracted_text(best_text)
             
         except Exception as e:
             logger.error(f"Error extracting text from image {image_path}: {e}")
             return ""
 
     def clean_extracted_text(self, text: str) -> str:
-        """Clean and normalize extracted text"""
+        """Clean and normalize extracted text for Nigerian context"""
+        if not text:
+            return ""
+            
         # Replace multiple spaces/newlines with single space
         text = re.sub(r'\s+', ' ', text)
         
         # Specific cleanup for Nigerian receipt artifacts
         replacements = {
             '0Pay': 'OPay', '0pay': 'OPay', 'QPay': 'OPay',
-            'Naira': 'NGN', 'naira': 'NGN', '₦': 'NGN', # Normalize currency
+            'Naira': 'NGN', 'naira': 'NGN', '₦': 'NGN', 
+            '#': 'NGN', # Often # is misread for ₦
             'transction': 'transaction', 'transacation': 'transaction',
             'sucessful': 'successful', 'reciept': 'receipt',
-            'recieved': 'received', 'beneficary': 'beneficiary'
+            'recieved': 'received', 'beneficary': 'beneficiary',
+            'amt': 'amount', 'txn': 'transaction', 'ref': 'reference'
         }
         
         for wrong, correct in replacements.items():
             text = text.replace(wrong, correct)
+            
+        # Handle 'N' if it's likely a currency symbol (followed by digit)
+        text = re.sub(r'\bN\s?(\d)', r'NGN \1', text)
         
         return text.strip()
 
     def extract_amounts_smart(self, text: str) -> List[float]:
         """
-        Smart amount extraction for Nigerian receipts
+        Smart amount extraction for Nigerian receipts.
+        Valid range: ₦100 – ₦10,000,000.
+        Ignores phone numbers, dates, and ref numbers.
         """
         amounts = []
         text_lower = text.lower()
         
-        # First, look for amount with NGN/₦ symbol
-        ngn_patterns = [
-            r'₦\s*([\d,]+\.?\d*)',
-            r'ngn\s*([\d,]+\.?\d*)',
-            r'([\d,]+\.?\d{2})\s*(?:₦|ngn)',
+        # 1. Matches with currency markers
+        currency_patterns = [
+            r'(?:₦|NGN|naira|n)\s*([\d,]+\.?\d*)',
+            r'([\d,]+\.?\d{2})\s*(?:₦|ngn|naira)',
         ]
         
-        for pattern in ngn_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
+        for p in currency_patterns:
+            for match in re.findall(p, text_lower):
                 try:
-                    clean_amount = match.replace(',', '')
-                    amount = float(clean_amount)
-                    amounts.append(amount)
-                except ValueError:
-                    continue
-        
-        # Look for common amount patterns in receipts
-        amount_keywords = [
-            'amount', 'total', 'sent', 'received', 'transfer',
-            'balance', 'sum', 'value', 'payment'
-        ]
-        
-        for keyword in amount_keywords:
-            pattern = rf'{keyword}[\s:]*[\s₦ngn]*([\d,]+\.?\d*)'
-            matches = re.findall(pattern, text_lower, re.IGNORECASE)
-            for match in matches:
+                    val = float(match.replace(',', ''))
+                    if 100 <= val <= 10000000:
+                        amounts.append(val)
+                except: continue
+
+        # 2. Key-word based matches
+        amount_keywords = ['amount', 'total', 'sent', 'received', 'transfer', 'balance', 'sum', 'value', 'paid']
+        for kw in amount_keywords:
+            p = rf'{kw}[\s:]*[\s₦ngn]*([\d,]+\.?\d*)'
+            for match in re.findall(p, text_lower):
                 try:
-                    clean_amount = match.replace(',', '')
-                    amount = float(clean_amount)
-                    # Filter out unlikely amounts (phone numbers, dates, etc.)
-                    if 100 <= amount <= 10000000:  # ₦100 to ₦10M
-                        amounts.append(amount)
-                except ValueError:
-                    continue
-        
-        # Extract standalone numbers that look like amounts
-        number_pattern = r'\b(\d{3,}[,\d]*\.?\d{2})\b'
-        matches = re.findall(number_pattern, text)
-        for match in matches:
+                    val = float(match.replace(',', ''))
+                    if 100 <= val <= 10000000:
+                        amounts.append(val)
+                except: continue
+
+        # 3. Floating points that look like currency (e.g. 5,000.00)
+        for match in re.findall(r'\b(\d{1,3}(?:,\d{3})*\.\d{2})\b', text):
             try:
-                clean_num = match.replace(',', '')
-                amount = float(clean_num)
-                # Filter: must be reasonable for a transaction
-                if 100 <= amount <= 10000000 and amount not in amounts:
-                    amounts.append(amount)
-            except ValueError:
+                val = float(match.replace(',', ''))
+                if 100 <= val <= 10000000:
+                    amounts.append(val)
+            except: continue
+
+        # Filter out common false positives (like 11-digit phone numbers starting with 0)
+        unique_amounts = []
+        for a in set(amounts):
+            a_str = f"{int(a)}"
+            if len(a_str) == 11 and a_str.startswith('0'):
                 continue
-        
-        # Remove duplicates and sort
-        unique_amounts = sorted(list(set(amounts)))
-        
-        # If we found multiple amounts, prioritize larger ones (transfers are usually significant)
-        if len(unique_amounts) > 1:
-            # Filter out amounts that look like phone numbers or IDs
-            filtered_amounts = []
-            for amount in unique_amounts:
-                amount_str = str(int(amount)) if amount.is_integer() else str(amount)
-                # Skip if it looks like a phone number (11 digits starting with 0)
-                if len(amount_str) == 11 and amount_str.startswith('0'):
-                    continue
-                # Skip if it looks like a date (2026, 2024, etc.)
-                if 2020 <= amount <= 2030:
-                    continue
-                filtered_amounts.append(amount)
-            return filtered_amounts
-        
-        return unique_amounts
+            # Skip if it's likely a year (2020-2030)
+            if 2020 <= a <= 2030:
+                continue
+            unique_amounts.append(a)
+            
+        return sorted(unique_amounts)
 
     def extract_dates_smart(self, text: str) -> List[datetime]:
         """
@@ -406,7 +442,7 @@ class ReceiptOCRProcessor:
 
     def extract_transaction_info(self, text: str) -> Dict[str, Any]:
         """
-        Extract transaction-specific information
+        Extract transaction-specific information with Nigerian intelligence
         """
         result = {
             "transaction_id": None,
@@ -418,50 +454,55 @@ class ReceiptOCRProcessor:
         
         text_lower = text.lower()
         
-        # Extract transaction ID
+        # 1. Transaction ID / Reference
         for pattern in self.transaction_patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                result["transaction_id"] = matches[0]
-                break
-        
-        # Extract sender/recipient info
-        sender_patterns = [
-            r'sender[\s:]*[\s]*(.+)',
-            r'from[\s:]*[\s]*(.+)',
-        ]
-        
-        recipient_patterns = [
-            r'recipient[\s:]*[\s]*(.+)',
-            r'to[\s:]*[\s]*(.+)',
-            r'beneficiary[\s:]*[\s]*(.+)',
-        ]
-        
-        for pattern in sender_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                result["sender"] = match.group(1).strip()[:100]
+                result["transaction_id"] = match.group(1).strip()
                 break
         
-        for pattern in recipient_patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                result["recipient"] = match.group(1).strip()[:100]
+        # 2. Sender / Recipient
+        sender_p = [
+            r'sender(?:[\s-]name)?[\s:]*[\s]*(.+)', 
+            r'from[\s:]*[\s]*(.+)', 
+            r'account[\s-]?holder[\s:]*[\s]*(.+)', 
+            r'source[\s:]*[\s]*(.+)',
+            r'sender[\s:]*([A-Z\s]{3,})'
+        ]
+        recipient_p = [
+            r'recipient(?:[\s-]name)?[\s:]*[\s]*(.+)', 
+            r'to[\s:]*[\s]*(.+)', 
+            r'beneficiary(?:[\s-]name)?[\s:]*[\s]*(.+)', 
+            r'destination[\s:]*[\s]*(.+)',
+            r'beneficiary[\s:]*([A-Z\s]{3,})'
+        ]
+        
+        for p in sender_p:
+            m = re.search(p, text, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                # Clean up if it captures too much (e.g. includes 'Amount')
+                val = re.split(r'amount|date|bank|ref|txn|time|success', val, flags=re.IGNORECASE)[0]
+                result["sender"] = val.strip()[:60]
+                break
+        for p in recipient_p:
+            m = re.search(p, text, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                val = re.split(r'amount|date|bank|ref|txn|time|success', val, flags=re.IGNORECASE)[0]
+                result["recipient"] = val.strip()[:60]
                 break
         
-        # Detect status
-        if any(kw in text_lower for kw in ['successful', 'success', 'completed', 'paid']):
-            result["status"] = "SUCCESSFUL"
-        elif any(kw in text_lower for kw in ['failed', 'declined', 'rejected']):
-            result["status"] = "FAILED"
-        elif any(kw in text_lower for kw in ['pending', 'processing']):
-            result["status"] = "PENDING"
+        # 3. Status Detection
+        for status, keywords in self.status_keywords.items():
+            if any(kw in text_lower for kw in keywords):
+                result["status"] = status
+                break
         
-        # Detect bank/service
-        services = ['opay', 'palmpay', 'paystack', 'flutterwave', 'moniepoint', 'gtbank', 'zenith', 'uba', 'firstbank', 'kuda', 'vfd', 'stanbic']
-        for service in services:
-            if service in text_lower:
-                result["bank_or_service"] = service.upper()
+        # 4. Bank / Service Detection
+        for bank in self.nigerian_banks:
+            if bank.lower() in text_lower:
+                result["bank_or_service"] = bank
                 break
         
         return result
@@ -473,17 +514,16 @@ class ReceiptOCRProcessor:
         expected_date: str = None
     ) -> Dict[str, Any]:
         """
-        Process a receipt file with improved Nigerian receipt parsing
+        Process a receipt file and return a structured object as per requirements.
         """
+        start_time = time.time()
         try:
-            start_time = datetime.now()
-            
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"File not found: {file_path}")
             
             file_ext = os.path.splitext(file_path)[1].lower()
             
-            # Extract text
+            # --- TEXT EXTRACTION ---
             if file_ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
                 extracted_text = self.extract_text_with_optimizations(file_path)
             elif file_ext == '.pdf':
@@ -491,101 +531,72 @@ class ReceiptOCRProcessor:
             else:
                 raise ValueError(f"Unsupported file type: {file_ext}")
             
-            # Extract information
-            extracted_amounts = self.extract_amounts_smart(extracted_text)
-            extracted_dates = self.extract_dates_smart(extracted_text)
-            transaction_info = self.extract_transaction_info(extracted_text)
+            # --- DATA EXTRACTION ---
+            amounts = self.extract_amounts_smart(extracted_text)
+            dates = self.extract_dates_smart(extracted_text)
+            info = self.extract_transaction_info(extracted_text)
+            confidence = self.calculate_confidence(extracted_text, amounts, dates)
             
-            processing_time = (datetime.now() - start_time).total_seconds()
-            
-            # Analyze image characteristics if it's an image
-            metadata = {}
+            # --- METADATA ---
+            metadata = {"path": file_path, "type": file_ext[1:]}
             if file_ext in ['.jpg', '.jpeg', '.png']:
                 img = cv2.imread(file_path)
                 if img is not None:
-                    metadata = self._get_image_characteristics(img)
+                    metadata["characteristics"] = self._get_image_characteristics(img)
 
-            result = {
-                "file_metadata": {
-                    "path": file_path,
-                    "type": file_ext[1:],
-                    "characteristics": metadata
+            # --- VALIDATION ---
+            validation = {"is_valid": False, "matched_amount": None, "matched_date": None, "score": 0.0}
+            if expected_amount and expected_date:
+                try:
+                    exp_date = datetime.strptime(expected_date, '%Y-%m-%d').date()
+                    
+                    # Match Amount (±2%)
+                    for a in amounts:
+                        if abs(a - expected_amount) <= (expected_amount * 0.02):
+                            validation["matched_amount"] = a
+                            break
+                    
+                    # Match Date (±1 day)
+                    for d in dates:
+                        if abs((d.date() - exp_date).days) <= 1:
+                            validation["matched_date"] = d.strftime('%Y-%m-%d')
+                            break
+                    
+                    validation["is_valid"] = validation["matched_amount"] is not None and validation["matched_date"] is not None
+                    validation["score"] = self.calculate_validation_score(
+                        validation["matched_amount"] is not None,
+                        validation["matched_date"] is not None,
+                        len(amounts), len(dates)
+                    )
+                except Exception as e:
+                    logger.error(f"Validation error: {e}")
+
+            processing_time = time.time() - start_time
+            
+            return {
+                "file_metadata": metadata,
+                "ocr_confidence": round(confidence, 2),
+                "extracted_data": {
+                    "amount": validation["matched_amount"] if validation["matched_amount"] else (amounts[0] if amounts else None),
+                    "date": validation["matched_date"] if validation["matched_date"] else (dates[0].strftime('%Y-%m-%d') if dates else None),
+                    "transaction_reference": info["transaction_id"],
+                    "sender": info["sender"],
+                    "recipient": info["recipient"],
+                    "bank": info["bank_or_service"],
+                    "status": info["status"],
+                    "all_amounts_found": amounts,
+                    "all_dates_found": [d.strftime('%Y-%m-%d') for d in dates]
                 },
-                "extraction_summary": {
-                    "text_found": bool(extracted_text.strip()),
-                    "amounts_count": len(extracted_amounts),
-                    "dates_count": len(extracted_dates),
-                    "confidence_score": self.calculate_confidence(extracted_text, extracted_amounts, extracted_dates)
-                },
-                "data": {
-                    "amounts": extracted_amounts,
-                    "dates": [d.strftime('%Y-%m-%d %H:%M:%S') for d in extracted_dates],
-                    "transaction_info": transaction_info,
-                    "raw_text_preview": extracted_text[:1000] + "..." if len(extracted_text) > 1000 else extracted_text
-                },
+                "validation_result": validation if expected_amount else None,
                 "performance": {
                     "processing_time_seconds": round(processing_time, 2),
                     "timestamp": datetime.now().isoformat()
                 }
             }
             
-            # Additional validation logic
-            if expected_amount is not None and expected_date is not None:
-                try:
-                    expected_date_obj = datetime.strptime(expected_date, '%Y-%m-%d')
-                    
-                    # Match Amount
-                    best_amount_match = None
-                    min_diff = float('inf')
-                    for amount in extracted_amounts:
-                        diff = abs(amount - expected_amount)
-                        if diff < min_diff:
-                            min_diff = diff
-                            best_amount_match = amount
-                    
-                    # Match Date
-                    best_date_match = None
-                    min_date_diff = float('inf')
-                    for date in extracted_dates:
-                        days_diff = abs((date.date() - expected_date_obj.date()).days)
-                        if days_diff < min_date_diff:
-                            min_date_diff = days_diff
-                            best_date_match = date
-
-                    # Detailed Validation Response
-                    result["validation"] = {
-                        "is_valid": min_diff <= (expected_amount * 0.02) and min_date_diff <= 1,
-                        "checks": {
-                            "amount_match": {
-                                "status": min_diff <= (expected_amount * 0.02),
-                                "expected": expected_amount,
-                                "found": best_amount_match,
-                                "difference": round(min_diff, 2)
-                            },
-                            "date_match": {
-                                "status": min_date_diff <= 1,
-                                "expected": expected_date,
-                                "found": best_date_match.strftime('%Y-%m-%d') if best_date_match else None,
-                                "days_difference": min_date_diff
-                            }
-                        },
-                        "score": self.calculate_validation_score(
-                            min_diff <= (expected_amount * 0.02),
-                            min_date_diff <= 1,
-                            len(extracted_amounts),
-                            len(extracted_dates)
-                        )
-                    }
-                except Exception as e:
-                    logger.error(f"Validation error: {e}")
-                    result["validation_error"] = str(e)
-            
-            return result
-            
         except Exception as e:
-            logger.error(f"Error processing file {file_path}: {e}")
+            logger.error(f"Critical error processing file {file_path}: {e}")
             return {
-                "file_path": file_path,
                 "error": str(e),
                 "success": False,
                 "processing_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
