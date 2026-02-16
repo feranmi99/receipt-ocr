@@ -244,7 +244,7 @@ async def validate_receipts_v2(
             best_result = max(results, key=lambda x: x.get("validation_result", {}).get("score", 0))
             
             extracted_data = best_result.get("extracted_data", {})
-            validation_result = best_result.get("validation_result", {})
+            validation_result = best_result.get("validation_result") or {}
             file_info = best_result.get("_file_info", {})
             
             # Structuring the response as requested
@@ -257,11 +257,14 @@ async def validate_receipts_v2(
                 "status": "processed",
                 "sender": extracted_data.get("sender") or "Not Found",
                 "recipient": extracted_data.get("recipient") or "Not Found",
-                "amount": amount,
-                "date": date,
+                "amount": amount,  # User's expected amount
+                "date": date,      # User's expected date
+                "match_amount": validation_result.get("matched_amount"),
+                "match_date": validation_result.get("matched_date"),
                 "isMatch": validation_result.get("is_valid", False),
                 "match_percentage": round(validation_result.get("score", 0) * 100, 2),
-                "performance": best_result.get("performance")
+                "performance": best_result.get("performance"),
+                "ocr_confidence": best_result.get("ocr_confidence")
             }
             
             return JSONResponse(content=response)

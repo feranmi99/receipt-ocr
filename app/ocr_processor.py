@@ -481,17 +481,25 @@ class ReceiptOCRProcessor:
             m = re.search(p, text, re.IGNORECASE)
             if m:
                 val = m.group(1).strip()
-                # Clean up if it captures too much (e.g. includes 'Amount')
-                val = re.split(r'amount|date|bank|ref|txn|time|success', val, flags=re.IGNORECASE)[0]
-                result["sender"] = val.strip()[:60]
-                break
+                # Clean up if it captures generic labels or too much
+                if val.lower() in ['details', 'name', 'account', 'customer', 'sender']:
+                    continue
+                val = re.split(r'amount|date|bank|ref|txn|time|success|terminal|merchant|location', val, flags=re.IGNORECASE)[0]
+                val = val.strip().strip(':').strip('-').strip()
+                if len(val) > 2:
+                    result["sender"] = val[:60]
+                    break
         for p in recipient_p:
             m = re.search(p, text, re.IGNORECASE)
             if m:
                 val = m.group(1).strip()
-                val = re.split(r'amount|date|bank|ref|txn|time|success', val, flags=re.IGNORECASE)[0]
-                result["recipient"] = val.strip()[:60]
-                break
+                if val.lower() in ['details', 'name', 'account', 'beneficiary', 'recipient']:
+                    continue
+                val = re.split(r'amount|date|bank|ref|txn|time|success|terminal|merchant|location', val, flags=re.IGNORECASE)[0]
+                val = val.strip().strip(':').strip('-').strip()
+                if len(val) > 2:
+                    result["recipient"] = val[:60]
+                    break
         
         # 3. Status Detection
         for status, keywords in self.status_keywords.items():
@@ -550,23 +558,48 @@ class ReceiptOCRProcessor:
                 try:
                     exp_date = datetime.strptime(expected_date, '%Y-%m-%d').date()
                     
-                    # Match Amount (±2%)
+                    # Match Amount (Prioritize exact match)
+                    best_a = None
+                    a_exact = False
                     for a in amounts:
-                        if abs(a - expected_amount) <= (expected_amount * 0.02):
-                            validation["matched_amount"] = a
+                        diff_pct = abs(a - expected_amount) / expected_amount if expected_amount != 0 else 0
+                        if diff_pct == 0:
+                            best_a = a
+                            a_exact = True
+                            break
+                        elif diff_pct <= 0.005 and best_a is None:
+                            best_a = a
+                    
+                    validation["matched_amount"] = best_a
+                    validation["amount_is_exact"] = a_exact
+                    
+                    # Match Date (Prioritize exact match)
+                    best_d = None
+                    d_exact = False
+                    for d in dates:
+                        if d.date() == exp_date:
+                            best_d = d.strftime('%Y-%m-%d')
+                            d_exact = True
                             break
                     
-                    # Match Date (±1 day)
-                    for d in dates:
-                        if abs((d.date() - exp_date).days) <= 1:
-                            validation["matched_date"] = d.strftime('%Y-%m-%d')
-                            break
+                    if not d_exact:
+                        for d in dates:
+                            if abs((d.date() - exp_date).days) <= 1:
+                                best_d = d.strftime('%Y-%m-%d')
+                                d_exact = False
+                                break
+                    
+                    validation["matched_date"] = best_d
+                    validation["date_is_exact"] = d_exact
                     
                     validation["is_valid"] = validation["matched_amount"] is not None and validation["matched_date"] is not None
+                    
+                    # Calculate score based on exactness
                     validation["score"] = self.calculate_validation_score(
-                        validation["matched_amount"] is not None,
-                        validation["matched_date"] is not None,
-                        len(amounts), len(dates)
+                        validation.get("matched_amount") is not None,
+                        validation.get("matched_date") is not None,
+                        validation.get("amount_is_exact", False),
+                        validation.get("date_is_exact", False)
                     )
                 except Exception as e:
                     logger.error(f"Validation error: {e}")
@@ -657,22 +690,32 @@ class ReceiptOCRProcessor:
         return min(confidence, 1.0)
 
     def calculate_validation_score(self, amount_match: bool, date_match: bool, 
-                                  num_amounts: int, num_dates: int) -> float:
-        """Calculate validation score"""
-        score = 0.0
-        
-        if amount_match:
-            score += 0.5
-        if date_match:
-            score += 0.5
-        
-        # Bonus for multiple matches
-        if num_amounts > 1:
-            score += 0.1
-        if num_dates > 1:
-            score += 0.1
-        
-        return min(score, 1.0)
+                                  amount_exact: bool = False, date_exact: bool = False) -> float:
+        """
+        Calculate validation score:
+        - Exact Amount & Date match: 1.0 (100%)
+        - Exact Amount, Fuzzy Date: 0.9 (90%)
+        - Fuzzy Amount, Exact Date: 0.8 (80%)
+        - Fuzzy Amount & Date: 0.7 (70%)
+        - Only Amount exact: 0.5
+        - Only Date exact: 0.4
+        """
+        if not amount_match or not date_match:
+            # If one is missing, partial score
+            score = 0.0
+            if amount_match: score += 0.4 + (0.1 if amount_exact else 0)
+            if date_match: score += 0.3 + (0.1 if date_exact else 0)
+            return score
+
+        # Both match, determine quality
+        if amount_exact and date_exact:
+            return 1.0
+        elif amount_exact:
+            return 0.9
+        elif date_exact:
+            return 0.8
+        else:
+            return 0.7
 
 
 # Global instance
